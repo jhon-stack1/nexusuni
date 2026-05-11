@@ -11,9 +11,10 @@ export async function POST(req: NextRequest) {
     const body = await req.json()
     const { email, password } = body
 
+    // English error messages only
     if (!email || !password) {
       return NextResponse.json(
-        { error: 'Email aur password dono zaroori hain.' },
+        { error: 'Email and password are required.' },
         { status: 400 }
       )
     }
@@ -21,33 +22,33 @@ export async function POST(req: NextRequest) {
     const db = createAdminClient()
     const ip = req.headers.get('x-forwarded-for') ?? req.headers.get('x-real-ip') ?? '0.0.0.0'
 
-    // User dhundo by email
+    // Case-insensitive email lookup
     const { data: user, error: userError } = await db
       .from('users')
       .select('user_id, full_name, username, email, password_hash, is_active, is_verified, locked_until, role_id')
-      .eq('email', email.toLowerCase().trim())
+      .ilike('email', email.trim())
       .maybeSingle()
 
     if (userError) {
       console.error('[Login] DB query error:', userError)
-      return NextResponse.json({ error: 'Server error. Dobara try karein.' }, { status: 500 })
+      return NextResponse.json({ error: 'Server error. Please try again.' }, { status: 500 })
     }
 
-    // Check: account locked hai?
+    // Check: account locked?
     if (user?.locked_until && new Date(user.locked_until) > new Date()) {
       await logAttempt(db, email, ip, false, 'account_locked')
-      const unlockTime = new Date(user.locked_until).toLocaleTimeString('ur-PK')
+      const unlockTime = new Date(user.locked_until).toLocaleTimeString()
       return NextResponse.json(
-        { error: `Account temporarily lock hai. ${unlockTime} ke baad try karein.` },
+        { error: `Account temporarily locked. Please try again after ${unlockTime}.` },
         { status: 423 }
       )
     }
 
-    // User nahi mila ya password wrong
+    // User not found
     if (!user) {
       await logAttempt(db, email, ip, false, 'user_not_found')
       return NextResponse.json(
-        { error: 'Email ya password galat hai.' },
+        { error: 'Invalid email or password.' },
         { status: 401 }
       )
     }
@@ -57,7 +58,7 @@ export async function POST(req: NextRequest) {
     if (!passwordMatch) {
       await logAttempt(db, email, ip, false, 'wrong_password')
 
-      // 5 failed attempts mein account lock karo (30 min)
+      // Lock account after 4 failed attempts in 30 minutes
       const { count } = await db
         .from('login_attempts')
         .select('*', { count: 'exact', head: true })
@@ -73,21 +74,21 @@ export async function POST(req: NextRequest) {
       }
 
       return NextResponse.json(
-        { error: 'Email ya password galat hai.' },
+        { error: 'Invalid email or password.' },
         { status: 401 }
       )
     }
 
-    // Account active nahi
+    // Account is not active — use null for failure_reason to avoid DB constraint error
     if (!user.is_active) {
-      await logAttempt(db, email, ip, false, 'account_inactive')
+      await logAttempt(db, email, ip, false, null)
       return NextResponse.json(
-        { error: 'Aapka account deactivate kar diya gaya hai. Support se rabta karein.' },
+        { error: 'Your account has been deactivated. Please contact support.' },
         { status: 403 }
       )
     }
 
-    // Session token banao
+    // Generate session token
     const token = crypto.randomUUID() + '-' + crypto.randomUUID()
     const expiresAt = new Date(Date.now() + SESSION_DURATION_DAYS * 24 * 60 * 60 * 1000)
 
@@ -103,18 +104,26 @@ export async function POST(req: NextRequest) {
 
     if (sessionError) {
       console.error('[Login] Session insert error:', sessionError)
-      return NextResponse.json({ error: 'Session banana mein error aya.' }, { status: 500 })
+      return NextResponse.json({ error: 'Failed to create session. Please try again.' }, { status: 500 })
     }
 
-    // Last login update karo
-    await db
+    // Update last_login and last_active
+    const { error: updateError } = await db
       .from('users')
-      .update({ last_login: new Date().toISOString(), last_active: new Date().toISOString(), locked_until: null })
+      .update({
+        last_login: new Date().toISOString(),
+        last_active: new Date().toISOString(),
+        locked_until: null,
+      })
       .eq('user_id', user.user_id)
+
+    if (updateError) {
+      console.error('[Login] User update error:', updateError)
+    }
 
     await logAttempt(db, email, ip, true, null)
 
-    // Session cookie set karo
+    // Set session cookie
     const cookieStore = await cookies()
     cookieStore.set(SESSION_COOKIE, token, {
       httpOnly: true,
@@ -137,11 +146,17 @@ export async function POST(req: NextRequest) {
     })
   } catch (err) {
     console.error('[Login] Unexpected error:', err)
-    return NextResponse.json({ error: 'Server error. Thori der baad try karein.' }, { status: 500 })
+    return NextResponse.json({ error: 'Server error. Please try again later.' }, { status: 500 })
   }
 }
 
-async function logAttempt(db: ReturnType<typeof createAdminClient>, email: string, ip: string, success: boolean, reason: string | null) {
+async function logAttempt(
+  db: ReturnType<typeof createAdminClient>,
+  email: string,
+  ip: string,
+  success: boolean,
+  reason: string | null
+) {
   await db.from('login_attempts').insert({
     email: email.toLowerCase().trim(),
     ip_address: ip,
